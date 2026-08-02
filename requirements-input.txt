@@ -1,0 +1,49 @@
+Original infrastructure requirements as provided (VPC + GKE spec).
+Note: the source document used "kepler-*" as example naming; this Terraform
+project uses "uma-enhub" naming throughout instead, per the actual project
+name/ID given (Uma-enhub / uma-enhub). CIDR ranges, regions, and toggles
+below were carried over as-is.
+
+VPC
+  Project:                 kepler-prod            -> uma-enhub
+  Region:                   us-central1
+  VPC Name:                 kepler-vpc             -> uma-enhub-vpc
+  Dynamic routing mode:     regional
+
+Subnet
+  Subnet Name (public):     kepler-public-subnet   -> uma-enhub-public-subnet
+  Subnet Name (private):    kepler-private-subnet  -> uma-enhub-private-subnet
+  Subnet Region:            us-central1
+  Subnet CIDR (public):     10.60.0.0/22
+  Subnet CIDR (private):    10.60.4.0/22
+  Flow logs:                enable/disable         -> enabled on private subnet
+
+GKE
+  Cluster Name:             kepler-prod-gke        -> uma-enhub-prod-gke
+  Cluster Region:           us-central1
+  Fleet management:         Enabled (needed for Istio/ASM)
+  Access using:              DNS / IPv4, config not outside the bastion
+  Network (VPC):            kepler-vpc             -> uma-enhub-vpc
+  Subnet:                    kepler-private-subnet -> uma-enhub-private-subnet
+  Enable private nodes:      yes (NAT added for internet egress)
+  Override control plane default private endpoint subnet: disable
+  Pod CIDR range:            10.60.8.0/28  (NOTE: flagged as too small - see CONFIG-DECISIONS.md)
+  Services CIDR range:       10.62.0.0/20
+  VPC firewall rule auto-creation for LoadBalancer Services: enable
+  Maintenance window:        enable
+  Target Release channel:    stable
+  Backup for GKE:            enable
+  Fleet registration:        Enabled
+  Fleet name:                kepler-prod-502406 fleet (Fleet is project-scoped; no separate name needed)
+  Binary Authorization:      no preference given -> DRYRUN_AUDIT_LOG_ONLY (see CONFIG-DECISIONS.md)
+  Secret manager:            Enable
+  Managed service mesh:      Enable (used instead of raw Istio)
+  Fleet Feature (Mesh):      servicemesh + configmanagement (both enabled)
+  Mesh Management Mode:      ASM / MANAGEMENT_AUTOMATIC
+  Deletion protection:       true (recommended default for prod)
+
+Project identifiers supplied separately:
+  Project name:   Uma-enhub
+  Project ID:     uma-enhub
+  GitHub email:   uma.ks@enhub.ai
+  GitHub user:    umaks-ui

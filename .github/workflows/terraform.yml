@@ -1,0 +1,305 @@
+name: Terraform Pipeline
+
+# -----------------------------------------------------------------------------
+# FIRST-TIME SETUP NOTE (read this before your first PR):
+# terraform-plan for gke/ and fleet/ reads REAL, already-applied state from
+# vpc/ (and iam/, and gke/ respectively) via terraform_remote_state - not
+# from another job's plan output. That means this pipeline only works once
+# vpc/, iam/, and gke/ have each been applied at least once already.
+#
+# On a brand new environment, do the FIRST apply manually and in order,
+# outside CI, before opening any PRs that touch this repo:
+#   bootstrap -> vpc -> iam -> gke -> fleet   (see README.md "Apply order")
+# After that one-time bootstrap, this pipeline's plan/apply flow works
+# normally on every subsequent PR/push.
+# -----------------------------------------------------------------------------
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VAR_FILE: prod.tfvars
+  TF_BACKEND_FILE: backend-prod.hcl
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Work out which root modules (vpc/, iam/, gke/, fleet/) actually need
+  #    to run.
+  #    - A change under modules/ (shared child modules) affects all four,
+  #      since vpc/, iam/, gke/, and fleet/ all call into modules/.
+  #    - A change under vpc/, iam/, gke/, or fleet/ only affects that root.
+  # ---------------------------------------------------------------------------
+  detect_changes:
+    runs-on: ubuntu-latest
+    outputs:
+      components: ${{ steps.filter.outputs.components }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git safe directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Detect changed root modules
+        id: filter
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "Running on PR"
+            git fetch origin ${{ github.base_ref }} --depth=1
+            BASE="origin/${{ github.base_ref }}"
+            HEAD="HEAD"
+          else
+            echo "Running on push"
+            BASE="HEAD~1"
+            HEAD="HEAD"
+          fi
+
+          echo "Diff range: $BASE $HEAD"
+          CHANGED=$(git diff --name-only $BASE..$HEAD || true)
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          COMPONENTS="[]"
+
+          if echo "$CHANGED" | grep -q "^modules/"; then
+            echo "Shared module changed - all root modules must run"
+            COMPONENTS='["vpc","iam","gke","fleet"]'
+          else
+            if echo "$CHANGED" | grep -q "^vpc/"; then
+              COMPONENTS=$(echo "$COMPONENTS" | jq -c '. + ["vpc"]')
+            fi
+            if echo "$CHANGED" | grep -q "^iam/"; then
+              COMPONENTS=$(echo "$COMPONENTS" | jq -c '. + ["iam"]')
+            fi
+            if echo "$CHANGED" | grep -q "^gke/"; then
+              COMPONENTS=$(echo "$COMPONENTS" | jq -c '. + ["gke"]')
+            fi
+            if echo "$CHANGED" | grep -q "^fleet/"; then
+              COMPONENTS=$(echo "$COMPONENTS" | jq -c '. + ["fleet"]')
+            fi
+          fi
+
+          echo "components=$COMPONENTS" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # 2. Plan every changed root module in parallel. Safe to run concurrently -
+  #    plan is read-only.
+  # ---------------------------------------------------------------------------
+  terraform-plan:
+    name: "Terraform Plan (${{ matrix.component }})"
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.components != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJson(needs.detect_changes.outputs.components) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Authenticate to GCP
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform Init
+        run: terraform init -backend-config=${{ env.TF_BACKEND_FILE }}
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -var-file=${{ env.TF_VAR_FILE }}
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: mshick/add-pr-comment@v2
+        with:
+          message: |
+            ## Terraform Plan for `${{ matrix.component }}`
+            ```
+            ${{ steps.plan.outputs.stdout }}
+            ```
+
+  # ---------------------------------------------------------------------------
+  # 3. Apply vpc/ and iam/ in parallel - neither depends on the other.
+  # ---------------------------------------------------------------------------
+  terraform-apply-vpc:
+    name: "Terraform Apply (vpc)"
+    needs: [detect_changes, terraform-plan]
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(needs.detect_changes.outputs.components, 'vpc')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: vpc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform Init
+        run: terraform init -backend-config=${{ env.TF_BACKEND_FILE }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var-file=${{ env.TF_VAR_FILE }}
+
+  terraform-apply-iam:
+    name: "Terraform Apply (iam)"
+    needs: [detect_changes, terraform-plan]
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(needs.detect_changes.outputs.components, 'iam')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: iam
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform Init
+        run: terraform init -backend-config=${{ env.TF_BACKEND_FILE }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var-file=${{ env.TF_VAR_FILE }}
+
+  # ---------------------------------------------------------------------------
+  # 4. Apply gke/ - it reads vpc/ and iam/ state via terraform_remote_state,
+  #    so it must not run until both have finished applying (if they ran at
+  #    all this pipeline).
+  # ---------------------------------------------------------------------------
+  terraform-apply-gke:
+    name: "Terraform Apply (gke)"
+    needs: [detect_changes, terraform-plan, terraform-apply-vpc, terraform-apply-iam]
+    if: >
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(needs.detect_changes.outputs.components, 'gke') &&
+      (needs.terraform-apply-vpc.result == 'success' || needs.terraform-apply-vpc.result == 'skipped') &&
+      (needs.terraform-apply-iam.result == 'success' || needs.terraform-apply-iam.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: gke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform Init
+        run: terraform init -backend-config=${{ env.TF_BACKEND_FILE }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var-file=${{ env.TF_VAR_FILE }}
+
+  # ---------------------------------------------------------------------------
+  # 5. Apply fleet/ LAST - it reads gke/ state via terraform_remote_state for
+  #    the cluster's fleet membership, so it must run after gke/ has applied
+  #    (or been skipped, if fleet/ was the only thing that changed).
+  # ---------------------------------------------------------------------------
+  terraform-apply-fleet:
+    name: "Terraform Apply (fleet)"
+    needs: [detect_changes, terraform-plan, terraform-apply-gke]
+    if: >
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(needs.detect_changes.outputs.components, 'fleet') &&
+      (needs.terraform-apply-gke.result == 'success' || needs.terraform-apply-gke.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: fleet
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.9.0'
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Terraform Init
+        run: terraform init -backend-config=${{ env.TF_BACKEND_FILE }}
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -var-file=${{ env.TF_VAR_FILE }}
